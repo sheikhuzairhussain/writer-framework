@@ -40,7 +40,10 @@ import {
 	isSourceFilesFile,
 	moveFileToSourceFiles,
 } from "./sourceFiles";
+import { usePromiseQueue } from "@/composables/usePromiseQueue";
+import { isPlainObjectDeepEqual } from "@/utils/object";
 
+type SyncHealth = "idle" | "connected" | "offline" | "suspended";
 const KEEP_ALIVE_DELAY_MS = 60000;
 
 export function generateCore() {
@@ -73,8 +76,7 @@ export function generateCore() {
 	const userStateInitial: ShallowRef<Record<string, unknown>> = ref({});
 	const userState: Ref<Record<string, any>> = ref({});
 	let webSocket: WebSocket;
-	const syncHealth: Ref<"idle" | "connected" | "offline" | "suspended"> =
-		ref("idle");
+	const syncHealth: Ref<SyncHealth> = ref("idle");
 	let frontendMessageCounter = 0;
 	const frontendMessageMap: Ref<
 		Map<number, { type: string; callback?: Function }>
@@ -97,10 +99,9 @@ export function generateCore() {
 		Boolean(writerAppId.value || writerOrgId.value),
 	);
 
-	/**
-	 * Initialise the core.
-	 * @returns
-	 */
+	const queue = usePromiseQueue({});
+
+	/** Initialise the core. */
 	async function init() {
 		await initSession();
 		sendKeepAliveMessage();
@@ -533,7 +534,11 @@ export function generateCore() {
 				resolve();
 			};
 
-			sendFrontendMessage("createSourceFile", { path }, messageCallback);
+			sendFrontendMessageQueue(
+				"createSourceFile",
+				{ path },
+				messageCallback,
+			);
 		});
 	}
 
@@ -559,7 +564,7 @@ export function generateCore() {
 				resolve();
 			};
 
-			sendFrontendMessage(
+			sendFrontendMessageQueue(
 				"uploadSourceFile",
 				{ path, content },
 				messageCallback,
@@ -588,7 +593,7 @@ export function generateCore() {
 				resolve();
 			};
 
-			sendFrontendMessage(
+			sendFrontendMessageQueue(
 				"renameSourceFile",
 				{ from, to },
 				messageCallback,
@@ -613,7 +618,11 @@ export function generateCore() {
 				resolve();
 			};
 
-			sendFrontendMessage("deleteSourceFile", { path }, messageCallback);
+			sendFrontendMessageQueue(
+				"deleteSourceFile",
+				{ path },
+				messageCallback,
+			);
 		});
 	}
 
@@ -631,7 +640,7 @@ export function generateCore() {
 				resolve();
 			};
 
-			sendFrontendMessage(
+			sendFrontendMessageQueue(
 				"codeSaveRequest",
 				{ code, path },
 				messageCallback,
@@ -653,7 +662,11 @@ export function generateCore() {
 
 				resolve();
 			};
-			sendFrontendMessage("loadSourceFile", { path }, messageCallback);
+			sendFrontendMessageQueue(
+				"loadSourceFile",
+				{ path },
+				messageCallback,
+			);
 		});
 	}
 
@@ -666,7 +679,7 @@ export function generateCore() {
 				if (!r.ok) return reject("Couldn't connect to the server.");
 				resolve(r.payload?.data ?? []);
 			};
-			sendFrontendMessage(
+			sendFrontendMessageQueue(
 				"listResources",
 				{ resource_type: type },
 				messageCallback,
@@ -697,6 +710,30 @@ export function generateCore() {
 			);
 		};
 		setTimeout(() => checkIfStateEnquiryRequired(0), INITIAL_FOLLOWUP_MS);
+	}
+
+	function waitSyncHealthToBe(value: SyncHealth) {
+		if (syncHealth.value === value) return;
+
+		// eslint-disable-next-line no-async-promise-executor
+		return new Promise<void>(async (res) => {
+			while (syncHealth.value !== value) {
+				await new Promise((r) => setInterval(r, 500));
+			}
+			return res();
+		});
+	}
+
+	async function sendFrontendMessageQueue(
+		type: string,
+		payload: object | (() => Promise<object>),
+		callback?: Function,
+		track = false,
+	) {
+		return queue.add(async () => {
+			await waitSyncHealthToBe("connected");
+			return sendFrontendMessage(type, payload, callback, track);
+		});
 	}
 
 	async function sendFrontendMessage(
@@ -773,6 +810,7 @@ export function generateCore() {
 		const payload = {
 			components: builderManagedComponents,
 		};
+		const copy = { ...components.value };
 
 		return new Promise((resolve, reject) => {
 			const messageCallback = (r: {
@@ -781,8 +819,15 @@ export function generateCore() {
 			}) => {
 				if (!r.ok) return reject("Couldn't connect to the server.");
 				resolve();
+				if (!isPlainObjectDeepEqual(components.value, copy)) {
+					components.value = copy;
+				}
 			};
-			sendFrontendMessage("componentUpdate", payload, messageCallback);
+			sendFrontendMessageQueue(
+				"componentUpdate",
+				payload,
+				messageCallback,
+			);
 		});
 	}
 
@@ -795,7 +840,7 @@ export function generateCore() {
 				if (!r.ok) return reject("Couldn't connect to the server.");
 				resolve();
 			};
-			sendFrontendMessage("writerVaultUpdate", {}, messageCallback);
+			sendFrontendMessageQueue("writerVaultUpdate", {}, messageCallback);
 		});
 	}
 
