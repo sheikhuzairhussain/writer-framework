@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - 'dev'
+  workflow_call:
+    inputs:
+      event_type:
+        description: 'Event type to send to the agent manager'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,8 +23,10 @@ jobs:
       run: |
         repo_owner="WriterInternal"
         repo_name="be.agent-manager"
-        event_type="trigger-workflow"
+        event_type="${{ github.event.inputs.event_type || 'framework_updated' }}"
         commit_sha=${{ github.sha }}
+
+        echo "Triggering agent manager with event_type=$event_type"
 
         curl -L \
           -X POST \

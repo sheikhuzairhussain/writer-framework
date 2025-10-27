@@ -2,16 +2,15 @@ name: publish
 
 on:
     push:
-        tags:
-            - 'agent-builder-turbo-[0-9]+.[0-9]+.[0-9]+-image-[0-9]+.[0-9]+.[0-9]+-main'
-            - 'agent-builder-turbo-[0-9]+.[0-9]+.[0-9]+rc[0-9]+-image-[0-9]+.[0-9]+.[0-9]+-main'
+        branches:
+          - 'dev'
     workflow_dispatch:
         inputs:
-            tag:
-                description: 'Tag to publish'
+            commit_sha:
+                description: 'Commit SHA to publish'
                 required: true
             version:
-                description: 'Version to set before publishing (optional, overrides extracted version)'
+                description: 'Version to publish (optional, overrides calculated version)'
                 required: false
 
 jobs:
@@ -22,33 +21,58 @@ jobs:
         steps:
             - uses: actions/checkout@v4
               with:
-                ref: ${{ github.event.inputs.tag || github.ref_name }}
-
-            - name: Extract version from tag
-              id: extract_version
-              run: |
-                if [[ -n "${{ github.event.inputs.version }}" ]]; then
-                    echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
-                else
-                    REF="${{ github.event.inputs.tag || github.ref_name }}"
-                    if [[ "$REF" =~ ^agent-builder-turbo-([0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?)-image-([0-9]+\.[0-9]+\.[0-9]+)-main$ ]]; then
-                        echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-                    else
-                        echo "Unable to parse version from tag: $REF" >&2
-                        exit 1
-                    fi
-                fi
-
-            - name: Show extracted version
-              run: echo "Version is ${{ steps.extract_version.outputs.version }}"
-
-            - name: Install poetry
-              run: pipx install poetry
+                ref: ${{ github.event.inputs.commit_sha || github.ref_name }}
 
             - name: Set up Python
               uses: actions/setup-python@v5
               with:
                 cache: 'poetry'
+
+            - name: Bump RC number from PyPI
+              id: bump_rc
+              run: |
+                pip install requests packaging
+                export PACKAGE="writer"
+                export VERSION_BASE="${{ needs.pr.outputs.version }}"
+
+                python - <<'EOF'
+                import requests, re, packaging.version, os, sys
+
+                pkg = os.getenv("PACKAGE")
+                base_version = os.getenv("VERSION_BASE")
+
+                resp = requests.get(f"https://pypi.org/pypi/{pkg}/json", timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                releases = list(data["releases"].keys())
+
+                # Filter for RCs of this base version
+                rc_versions = [
+                    v for v in releases
+                    if v.startswith(base_version) and "rc" in v
+                ]
+
+                if rc_versions:
+                    latest = sorted(rc_versions, key=packaging.version.parse)[-1]
+                    match = re.search(r"rc(\d+)", latest)
+                    next_rc_num = int(match.group(1)) + 1 if match else 1
+                else:
+                    next_rc_num = 1
+
+                final_version = f"{base_version}rc{next_rc_num}"
+
+                print(f"Next RC version: {final_version}")
+                output_path = os.environ["GITHUB_OUTPUT"]
+                with open(output_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"release_candidate={next_rc_num}\n")
+                    fh.write(f"final_version={final_version}\n")
+                EOF
+
+            - name: Show calculated version
+              run: echo "Calculated version is ${{ steps.bump_rc.outputs.final_version }}"
+
+            - name: Install poetry
+              run: pipx install poetry
 
             - name: Use Node.js
               uses: actions/setup-node@v4
@@ -57,15 +81,20 @@ jobs:
                 cache: npm
 
             - name: Update version before publishing
-              run: poetry version ${{ steps.extract_version.outputs.version }}
+              run: poetry version ${{ steps.bump_rc.outputs.version || github.event.inputs.version }}
 
             - name: install python3 environment
               run: poetry install --with build
 
             - name: install ci dependencies and generate code
-              run: WRITER_FRAMEWORK_VERSION=${{ steps.extract_version.outputs.version }} poetry run alfred install.ci
+              run: WRITER_FRAMEWORK_VERSION=${{ steps.bump_rc.outputs.version || github.event.inputs.version }} poetry run alfred install.ci
 
             - name: publish on pypi
-              run: WRITER_FRAMEWORK_VERSION=${{ steps.extract_version.outputs.version }} poetry run alfred publish.pypi
+              run: WRITER_FRAMEWORK_VERSION=${{ steps.bump_rc.outputs.version || github.event.inputs.version }} poetry run alfred publish.pypi
               env:
                   PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+
+            - name: Trigger Agent Manager workflow
+              uses: ./.github/workflows/trigger-workflow.yml
+              with:
+                event_type: framework_published
